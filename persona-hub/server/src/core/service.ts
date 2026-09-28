@@ -22,7 +22,7 @@ export class CoreService {
   }
 
   listVisiblePersonas(conn: Connection): Array<Persona & { fact_count: number }> {
-    return conn.persona_ids
+    return [...new Set(conn.persona_ids)]
       .map((id) => this.visiblePersona(conn, id))
       .filter((p): p is Persona => p !== null)
       .map((p) => ({ ...p, fact_count: this.visibleFacts(conn, p.id).length }));
@@ -30,7 +30,7 @@ export class CoreService {
 
   /** Returns null for missing AND out-of-scope personas alike. */
   visiblePersona(conn: Connection, personaId: string): Persona | null {
-    if (!conn.persona_ids.includes(personaId)) return null;
+    if (conn.revoked_at !== null || !conn.persona_ids.includes(personaId)) return null;
     const p = this.store.personas.get(personaId);
     if (!p || p.archived || p.user_id !== conn.user_id) return null;
     return p;
@@ -52,7 +52,7 @@ export class CoreService {
    * MVP swaps this for pgvector embeddings; the filter stays identical.
    */
   searchFacts(conn: Connection, query: string, personaId: string | undefined, limit: number): Fact[] {
-    const personaIds = personaId ? [personaId] : conn.persona_ids;
+    const personaIds = personaId ? [personaId] : [...new Set(conn.persona_ids)];
     const candidates = personaIds.flatMap((id) => this.visibleFacts(conn, id));
     const q = grams(query);
     return candidates
@@ -76,7 +76,8 @@ export class CoreService {
   createConnection(input: Pick<Connection, "user_id" | "client_id" | "client_name" | "persona_ids" | "max_sensitivity">): Connection {
     const conn: Connection = {
       ...input,
-      persona_ids: input.persona_ids.filter((id) => this.store.personas.get(id)?.user_id === input.user_id),
+      persona_ids: this.ownedIds(input.user_id, input.persona_ids),
+      max_sensitivity: clampSensitivity(input.max_sensitivity),
       id: newId("con"),
       created_at: new Date().toISOString(),
       revoked_at: null,
@@ -89,8 +90,8 @@ export class CoreService {
   updateScope(connectionId: string, userId: string, scope: Pick<Connection, "persona_ids" | "max_sensitivity">): Connection | null {
     const c = this.store.connections.get(connectionId);
     if (!c || c.user_id !== userId || c.revoked_at) return null;
-    c.persona_ids = scope.persona_ids.filter((id) => this.store.personas.get(id)?.user_id === userId);
-    c.max_sensitivity = scope.max_sensitivity;
+    c.persona_ids = this.ownedIds(userId, scope.persona_ids);
+    c.max_sensitivity = clampSensitivity(scope.max_sensitivity);
     return c;
   }
 
@@ -113,9 +114,18 @@ export class CoreService {
       .reverse();
   }
 
+  private ownedIds(userId: string, ids: string[]): string[] {
+    return [...new Set(ids)].filter((id) => this.store.personas.get(id)?.user_id === userId);
+  }
+
   listUserPersonas(userId: string): Persona[] {
     return [...this.store.personas.values()].filter((p) => p.user_id === userId && !p.archived);
   }
+}
+
+/** Anything other than "sensitive" (including a smuggled "private") collapses to the safe default. */
+function clampSensitivity(s: string): Connection["max_sensitivity"] {
+  return s === "sensitive" ? "sensitive" : "normal";
 }
 
 function grams(s: string): Set<string> {
