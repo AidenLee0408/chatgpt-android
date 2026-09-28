@@ -1,0 +1,24 @@
+# Local dev only. `docker compose -f db/docker-compose.yml up -d && db/scripts/migrate.sh`
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: persona
+      POSTGRES_PASSWORD: persona
+      POSTGRES_DB: persona_hub
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U persona -d persona_hub"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  redis:
+    image: redis:7
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      retries: 30
+volumes:
+  pgdata:
