@@ -1,0 +1,124 @@
+name: Persona Hub Deploy
+
+# Flow: main push -> CI gate -> build & push image (ECR) -> staging (auto) -> production (manual approval)
+# PLACEHOLDERS to configure in GitHub (Settings -> Environments / Variables):
+#   vars.AWS_ACCOUNT_ID                  e.g. 000000000000 (PLACEHOLDER)
+#   vars.PERSONA_HUB_BUILD_ROLE_ARN      OIDC role allowed to push to ECR (PLACEHOLDER)
+#   Environment "persona-hub-staging":    vars.DEPLOY_ROLE_ARN (PLACEHOLDER)
+#   Environment "persona-hub-production": vars.DEPLOY_ROLE_ARN (PLACEHOLDER) + Required reviewers enabled
+# No static AWS keys: all jobs assume roles via GitHub OIDC (id-token: write).
+
+on:
+  push:
+    branches: [ main ]
+    paths: [ 'persona-hub/server/**', 'persona-hub/infra/**', '.github/workflows/persona-hub-deploy.yml' ]
+  workflow_dispatch:
+
+concurrency:
+  group: persona-hub-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ap-northeast-2
+  ECR_REPOSITORY: persona-hub-server
+  SERVICES: api oauth mcp
+
+jobs:
+  gate:
+    name: persona-hub permission gate & tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: persona-hub/server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: persona-hub/server/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+  build:
+    needs: gate
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.PERSONA_HUB_BUILD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - id: meta
+        run: echo "image=${{ steps.ecr.outputs.registry }}/${ECR_REPOSITORY}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: persona-hub/server
+          platforms: linux/arm64   # matches ECS runtime_platform ARM64 (Graviton)
+          push: true
+          tags: ${{ steps.meta.outputs.image }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-staging:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: persona-hub-staging
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+      - name: Terraform apply (staging)
+        working-directory: persona-hub/infra/terraform
+        run: |
+          terraform init -input=false -backend-config=envs/staging.backend.hcl
+          terraform apply -input=false -auto-approve \
+            -var-file=envs/staging.tfvars -var "image_uri=${{ needs.build.outputs.image }}"
+      - name: Wait for services stable
+        run: |
+          for s in $SERVICES; do
+            aws ecs wait services-stable --cluster persona-hub-staging --services "$s"
+          done
+      - name: Smoke test
+        run: curl -fsS "${{ vars.PERSONA_HUB_BASE_URL }}/healthz"  # PLACEHOLDER var per environment
+
+  deploy-production:
+    needs: [ build, deploy-staging ]
+    runs-on: ubuntu-latest
+    environment:
+      name: persona-hub-production   # configure Required reviewers on this environment
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+      - name: Terraform apply (production)
+        working-directory: persona-hub/infra/terraform
+        run: |
+          terraform init -input=false -backend-config=envs/production.backend.hcl
+          terraform apply -input=false -auto-approve \
+            -var-file=envs/production.tfvars -var "image_uri=${{ needs.build.outputs.image }}"
+      - name: Wait for services stable
+        run: |
+          for s in $SERVICES; do
+            aws ecs wait services-stable --cluster persona-hub-production --services "$s"
+          done
+      - name: Smoke test
+        run: curl -fsS "${{ vars.PERSONA_HUB_BASE_URL }}/healthz"

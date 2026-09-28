@@ -1,0 +1,59 @@
+name: Persona Hub CI
+
+on:
+  push:
+    branches: [ main ]
+    paths: [ 'persona-hub/**', '.github/workflows/persona-hub.yml' ]
+  pull_request:
+    paths: [ 'persona-hub/**', '.github/workflows/persona-hub.yml' ]
+
+concurrency:
+  group: persona-hub-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  server:
+    # Required status check in branch protection: permission tests must pass.
+    name: persona-hub permission gate & tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: persona-hub/server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: persona-hub/server/package-lock.json
+      - run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Tests (incl. permission tests — required gate)
+        run: npm test
+
+  mobile:
+    name: persona-hub mobile typecheck
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: persona-hub/mobile
+    steps:
+      - uses: actions/checkout@v4
+      - name: Skip if no mobile project
+        id: check
+        working-directory: .
+        run: echo "present=${{ hashFiles('persona-hub/mobile/package.json') != '' }}" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
+        if: steps.check.outputs.present == 'true'
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: persona-hub/mobile/package-lock.json
+      - if: steps.check.outputs.present == 'true'
+        run: npm ci
+      - if: steps.check.outputs.present == 'true'
+        run: npx tsc --noEmit
