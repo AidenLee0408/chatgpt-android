@@ -88,3 +88,15 @@ EAS 클라우드 빌드로 설치 파일을 만듭니다. Android Studio는 필�
 - `preview` 빌드는 개발용입니다. 개발 로그인이 켜져 있고, 로컬 서버를 위해 http 통신을 허용합니다. 운영 빌드에서는 둘 다 꺼야 합니다.
 - 서버는 메모리 저장소라 서버를 끄면 데이터가 초기화됩니다.
 - iPhone 설치에는 Apple Developer 계정(연 $99)이 필요합니다. 그 전에는 Expo Go로 써 보세요(위 "실행" 참고).
+
+## Android Studio로 빌드해서 폰에 설치하기
+
+`android/` 폴더가 저장소에 포함돼 있어서, 코드를 받은 뒤 `npm install`만 하면 바로 열 수 있습니다.
+
+1. `cd persona-hub/mobile && npm install`
+2. Android Studio → Open → `persona-hub/mobile/android`
+3. Build Variants에서 `app`을 **release**로 바꿉니다. release는 앱 안에 코드가 들어가 폰 단독으로 실행되고, 디버그 키로 서명돼 바로 설치됩니다.
+4. USB 디버깅을 켠 폰을 연결하고 ▶ Run을 누릅니다.
+5. PC에서 서버를 켜고(`cd ../server && npm install && ALLOW_DEV_LOGIN=1 npm start`), 앱 로그인 화면의 서버 주소에 `http://<PC 내부 IP>:3000`을 넣습니다.
+
+`app.json`이나 네이티브 플러그인을 바꾼 뒤에는 `npx expo prebuild -p android`로 `android/`를 다시 생성해서 커밋해 주세요.

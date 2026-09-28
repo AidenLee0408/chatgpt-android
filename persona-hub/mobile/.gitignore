@@ -38,8 +38,12 @@ yarn-error.*
 
 # generated native folders
 /ios
-/android
+# /android is committed so the project opens directly in Android Studio.
+# Regenerate with `npx expo prebuild -p android` after changing app.json.
 
 # env
 .env
 .env.local
+
+# Committed dev defaults (no secrets); keep real secrets in .env.local
+!.env
