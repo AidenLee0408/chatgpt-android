@@ -1,7 +1,9 @@
 // Shared harness for /v1 tests (not a test file itself).
+import assert from "node:assert/strict";
 import { createServer as createHttpServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { createServer, type ServerOptions } from "../src/main.js";
+import type { ServerConfig } from "../src/contracts.js";
 
 export interface Harness {
   base: string;
@@ -14,12 +16,12 @@ export interface Harness {
 
 export const PASSWORD = "pw";
 
-export async function start(opts: ServerOptions = {}): Promise<Harness> {
+export async function start(opts: ServerOptions = {}, configOverrides: Partial<ServerConfig> = {}): Promise<Harness> {
   const probe = await new Promise<Server>((r) => { const s = createHttpServer(); s.listen(0, () => r(s)); });
   const port = (probe.address() as AddressInfo).port;
   await new Promise((r) => probe.close(r));
   const base = `http://localhost:${port}`;
-  const server = createServer({ baseUrl: base, testUserPassword: PASSWORD }, "test-app-token", { allowDevLogin: true, jwtSecret: "test-secret", ...opts });
+  const server = createServer({ baseUrl: base, testUserPassword: PASSWORD, registerPerHour: 1000, ...configOverrides }, "test-app-token", { allowDevLogin: true, jwtSecret: "test-secret", ...opts });
   const http = await new Promise<Server>((r) => { const s = server.app.listen(port, () => r(s)); });
 
   const call: Harness["call"] = async (path, init = {}) => {
@@ -76,8 +78,11 @@ export async function oauthConnect(base: string, personaIds: string[], maxSensit
   const challenge = createHash("sha256").update(verifier).digest("base64url");
   const q = new URLSearchParams({ client_id, redirect_uri: REDIRECT, response_type: "code", code_challenge: challenge, code_challenge_method: "S256", state: "s" });
   const a = await fetch(`${base}/authorize?${q}`);
-  const cookie = a.headers.get("set-cookie")!.split(";")[0];
-  const login = await fetch(`${base}/authorize/login`, { method: "POST", headers: { cookie }, body: form({ ...hidden(await a.text()), password: PASSWORD }) });
+  const preCookie = a.headers.get("set-cookie")!.split(";")[0];
+  const login = await fetch(`${base}/authorize/login`, { method: "POST", headers: { cookie: preCookie }, body: form({ ...hidden(await a.text()), password: PASSWORD }) });
+  // M-2: login issues a new session id; the pre-login cookie is dead.
+  const cookie = login.headers.get("set-cookie")!.split(";")[0];
+  assert.notEqual(cookie, preCookie);
   const consentHtml = await login.text();
   const approve = await fetch(`${base}/authorize/consent`, {
     method: "POST", redirect: "manual", headers: { cookie },

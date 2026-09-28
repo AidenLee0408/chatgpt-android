@@ -44,6 +44,16 @@ function rateLimited(connectionId: string): boolean {
 }
 /** Test hook. */
 export function resetRateLimits(): void { hits.clear(); }
+/** L-5: drops keys whose window has fully expired. Runs every minute (unref'd timer). */
+export function sweepRateLimits(now = Date.now()): number {
+  let n = 0;
+  for (const [k, arr] of hits) {
+    if (!arr.some((t) => now - t < 60_000)) { hits.delete(k); n++; }
+  }
+  return n;
+}
+export function rateLimitKeyCount(): number { return hits.size; }
+setInterval(() => sweepRateLimits(), 60_000).unref();
 
 const errorResult = (text: string): CallToolResult => ({ isError: true, content: [{ type: "text", text }] });
 const day = (iso: string) => iso.slice(0, 10);
@@ -225,8 +235,10 @@ export const mountMcp: MountMcp = (app, { core, config, oauth }) => {
     const h = req.headers.authorization ?? "";
     const m = /^Bearer\s+(.+)$/i.exec(h);
     const info = m ? oauth.verifyAccessToken(m[1].trim()) : null;
-    const conn = info && info.expiresAt * 1000 > Date.now() ? core.activeConnection(info.connectionId) : null;
-    if (!info || !conn) {
+    // M-3: a token bound to another resource (audience) is not valid here.
+    const audienceOk = !!info && (info.resource === undefined || info.resource === resource);
+    const conn = info && audienceOk && info.expiresAt * 1000 > Date.now() ? core.activeConnection(info.connectionId) : null;
+    if (!info || !audienceOk || !conn) {
       const err = m ? ', error="invalid_token"' : "";
       res.status(401)
         .set("WWW-Authenticate", `Bearer resource_metadata="${resourceMetadataUrl}"${err}`)

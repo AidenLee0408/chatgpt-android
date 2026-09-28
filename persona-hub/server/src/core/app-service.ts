@@ -1,7 +1,7 @@
 import { newId } from "./ids.js";
 import type { Store } from "./store.js";
 import type { CoreService } from "./service.js";
-import { detectPrivatePattern } from "./privacy.js";
+import { detectPrivatePattern, redactPrivatePatterns, REDACTION_MARKER } from "./privacy.js";
 import { getTemplate } from "./templates.js";
 import type { FactExtractor } from "./extractor.js";
 import {
@@ -35,6 +35,9 @@ const NOT_FOUND = {
   export: "내보내기를 찾을 수 없어요.",
   user: "계정을 찾을 수 없어요.",
 } as const;
+
+/** M-6: exports (a full copy of the user's data) live at most 24 hours. */
+export const EXPORT_TTL_MS = 24 * 3600_000;
 
 const notFound = (what: keyof typeof NOT_FOUND) => new DomainError("not_found", NOT_FOUND[what]);
 
@@ -122,10 +125,26 @@ export class AppService {
     };
   }
 
+  /** True only when the user gave the separate 민감정보 consent (PIPA §23). */
+  hasSensitiveConsent(userId: string): boolean {
+    return this.user(userId)?.consents?.sensitive_data === true;
+  }
+
+  /**
+   * M-4: withdrawing sensitive_data consent downgrades every active connection to "normal"
+   * so no sensitive fact is transferred afterwards. Returns the downgraded connection ids in `downgraded`.
+   */
   updateConsents(userId: string, patch: Partial<Omit<Consents, "updated_at" | "terms">>) {
     const u = this.requireUser(userId);
     const prev = u.consents ?? { terms: true, sensitive_data: false, marketing: false, updated_at: "" };
     u.consents = { ...prev, ...patch, updated_at: new Date().toISOString() };
+    if (patch.sensitive_data === false) {
+      for (const c of this.core.listConnections(userId)) {
+        if (!c.revoked_at && c.max_sensitivity === "sensitive") {
+          this.core.updateScope(c.id, userId, { persona_ids: c.persona_ids, max_sensitivity: "normal" });
+        }
+      }
+    }
     return this.me(userId);
   }
 
@@ -342,7 +361,11 @@ export class AppService {
     return i;
   }
 
-  submitAnswers(userId: string, id: string, answers: Array<{ question_id: string; text: string }>): Interview {
+  /**
+   * Stores raw answers. M-8: private-pattern content is never stored — matching segments are
+   * replaced by REDACTION_MARKER before the answer is kept (and later exported).
+   */
+  submitAnswers(userId: string, id: string, answers: Array<{ question_id: string; text: string }>): { interview: Interview; redacted_count: number } {
     const i = this.ownInterview(userId, id);
     if (i.status === "committed") throw new DomainError("validation_failed", "이미 저장한 인터뷰예요.");
     const t = getTemplate(i.template_id)!;
@@ -351,12 +374,18 @@ export class AppService {
       if (!t.questions.some((q) => q.id === a.question_id)) {
         throw new DomainError("validation_failed", "이 템플릿에 없는 질문이에요.", "question_id");
       }
+    }
+    let redacted_count = 0;
+    for (const a of answers) {
       i.answers = i.answers.filter((x) => x.question_id !== a.question_id);
-      if (a.text.trim()) i.answers.push({ question_id: a.question_id, text: a.text.trim(), answered_at: now });
+      if (!a.text.trim()) continue;
+      const r = redactPrivatePatterns(a.text.trim());
+      redacted_count += r.redacted;
+      i.answers.push({ question_id: a.question_id, text: r.text, answered_at: now, ...(r.redacted ? { redacted: true } : {}) });
     }
     i.status = "in_progress";
     i.updated_at = now;
-    return i;
+    return { interview: i, redacted_count };
   }
 
   /** Runs the extractor. Candidates that match a private pattern are dropped (never stored) and reported in `blocked`. */
@@ -371,6 +400,10 @@ export class AppService {
     const blocked: Array<{ question_id: string | null; reason: string }> = [];
     i.candidates = [];
     for (const e of extracted) {
+      if (e.body.includes(REDACTION_MARKER)) {
+        blocked.push({ question_id: e.question_id, reason: "비공개 정보처럼 보여서 저장하지 않았어요." });
+        continue;
+      }
       const hit = detectPrivatePattern(e.body);
       if (hit) {
         blocked.push({ question_id: e.question_id, reason: hit.message });
@@ -425,12 +458,25 @@ export class AppService {
     return !!scope.max_sensitivity && SENSITIVITY_RANK[scope.max_sensitivity] > SENSITIVITY_RANK[c.max_sensitivity];
   }
 
+  /**
+   * H-1: scope widening is enforced here (not only in the route) so no caller can skip it —
+   * `opts.stepUpVerified` must be true when the new scope grants anything new.
+   * M-4: "sensitive" needs the user's separate sensitive-data consent.
+   */
   updateConnection(
     userId: string, id: string,
-    scope: { persona_ids?: string[]; max_sensitivity?: Connection["max_sensitivity"] }, ifMatch?: number,
+    scope: { persona_ids?: string[]; max_sensitivity?: Connection["max_sensitivity"] },
+    ifMatch: number | undefined,
+    opts: { stepUpVerified: boolean },
   ): Connection {
     const c = this.ownConnection(userId, id);
     if (c.revoked_at) throw notFound("connection");
+    if (this.isScopeWidening(c, scope) && !opts.stepUpVerified) {
+      throw new DomainError("step_up_required", "민감한 작업이라 본인 확인이 필요해요.");
+    }
+    if (scope.max_sensitivity === "sensitive" && !this.hasSensitiveConsent(userId)) {
+      throw new DomainError("validation_failed", "민감정보 공유에 동의해야 민감 정보를 연결할 수 있어요.", "max_sensitivity");
+    }
     checkVersion(c.version, ifMatch);
     for (const pid of scope.persona_ids ?? []) {
       const p = this.store.personas.get(pid);
@@ -461,8 +507,10 @@ export class AppService {
       });
   }
 
-  factExists(id: string): boolean {
-    return this.store.facts.has(id);
+  /** M-5: owner-scoped existence check (no cross-user oracle). */
+  ownFactExists(userId: string, id: string): boolean {
+    const f = this.store.facts.get(id);
+    return !!f && this.store.personas.get(f.persona_id)?.user_id === userId;
   }
 
   // ---------- context packs (F-08) ----------
@@ -495,19 +543,32 @@ export class AppService {
       access_logs: this.store.accessLogs.filter((l) => conIds.has(l.connection_id)),
       interviews: [...this.store.interviews.values()].filter((i) => i.user_id === userId).map(({ user_id: _u, ...i }) => i),
     };
-    const job: ExportJob = { id: newId("exp"), user_id: userId, status: "ready", data, created_at: new Date().toISOString() };
+    const created = Date.now();
+    const job: ExportJob = {
+      id: newId("exp"), user_id: userId, status: "ready", data,
+      created_at: new Date(created).toISOString(), expires_at: new Date(created + EXPORT_TTL_MS).toISOString(),
+    };
     this.store.exports.set(job.id, job);
     return job;
   }
 
-  ownExport(userId: string, id: string): ExportJob {
+  /** Owner-scoped; expired exports look exactly like missing ones (M-5, M-6). */
+  ownExport(userId: string, id: string, now = Date.now()): ExportJob {
     const e = this.store.exports.get(id);
-    if (!e || e.user_id !== userId) throw notFound("export");
+    if (!e || e.user_id !== userId || Date.parse(e.expires_at) <= now) throw notFound("export");
     return e;
   }
 
-  exportById(id: string): ExportJob | undefined {
-    return this.store.exports.get(id);
+  /** M-6: deletes exports past expires_at (their data snapshot included). Run periodically. */
+  purgeExpiredExports(now = Date.now()): number {
+    let n = 0;
+    for (const [k, e] of this.store.exports) {
+      if (Date.parse(e.expires_at) <= now) {
+        this.store.exports.delete(k);
+        n++;
+      }
+    }
+    return n;
   }
 }
 

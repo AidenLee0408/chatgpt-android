@@ -1,6 +1,6 @@
 import { newId } from "./ids.js";
 import type { Store } from "./store.js";
-import { SENSITIVITY_RANK, type AccessLog, type Connection, type Fact, type Persona } from "./types.js";
+import { SENSITIVITY_RANK, type AccessLog, type Connection, type Consents, type Fact, type Persona } from "./types.js";
 
 /**
  * The ONLY read path for persona data. Every entry point (app API, MCP) goes
@@ -121,6 +121,12 @@ export class CoreService {
 
   private ownedIds(userId: string, ids: string[]): string[] {
     return [...new Set(ids)].filter((id) => this.store.personas.get(id)?.user_id === userId);
+  }
+
+  /** Consents of a live user (M-4: OAuth consent checks sensitive_data). */
+  userConsents(userId: string): Consents | null {
+    const u = this.store.users.get(userId);
+    return u && !u.deleted_at ? u.consents ?? null : null;
   }
 
   listUserPersonas(userId: string): Persona[] {

@@ -15,6 +15,8 @@ export interface AccessTokenInfo {
   clientId: string;
   /** seconds since epoch */
   expiresAt: number;
+  /** RFC 8707 resource (audience) bound at authorization time; MCP rejects tokens for another resource (M-3). */
+  resource?: string;
 }
 
 export interface OAuthModule {
@@ -31,6 +33,10 @@ export interface ServerConfig {
   baseUrl: string;
   /** PoC login: shared test password for the single seeded user. */
   testUserPassword: string;
+  /** C-1: exact redirect-URI origin → display name for the verified badge. Defaults in config.ts. */
+  knownClients?: Record<string, string>;
+  /** M-1: DCR registrations allowed per IP per hour (default 10). */
+  registerPerHour?: number;
 }
 
 export interface ModuleDeps {

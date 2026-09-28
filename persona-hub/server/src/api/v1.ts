@@ -86,8 +86,11 @@ export function mountV1(app: Express, deps: V1Deps): void {
   const r = express.Router();
   const PUBLIC = new Set(["POST /auth/login", "POST /auth/refresh", "POST /auth/logout"]);
 
-  const stepUp = (req: Request) => {
-    if (!auth.hasStepUp(req.header("x-step-up-token"), req.userId!)) throw new DomainError("step_up_required", STEP_UP_MSG);
+  /** H-1: session-bound step-up. `consume` = single-use (high-risk: DELETE /me, exports). */
+  const hasStepUp = (req: Request, consume = false) =>
+    auth.hasStepUp(req.header("x-step-up-token"), req.userId!, req.sessionId!, { consume });
+  const stepUp = (req: Request, consume = false) => {
+    if (!hasStepUp(req, consume)) throw new DomainError("step_up_required", STEP_UP_MSG);
   };
   const uid = (req: Request) => req.userId!;
   const personaNames = (userId: string) => new Map(svc.listPersonas(userId, "all").map((p) => [p.id, p.name]));
@@ -148,7 +151,7 @@ export function mountV1(app: Express, deps: V1Deps): void {
   }));
 
   r.delete("/me", wrap((req, res) => {
-    stepUp(req);
+    stepUp(req, true);
     for (const id of svc.deleteUser(uid(req))) oauth.revokeConnectionTokens(id);
     res.status(204).end();
   }));
@@ -188,7 +191,7 @@ export function mountV1(app: Express, deps: V1Deps): void {
       sensitivity: req.query.sensitivity, category: req.query.category,
     });
     const userId = uid(req);
-    const stepped = auth.hasStepUp(req.header("x-step-up-token"), userId);
+    const stepped = hasStepUp(req);
     let sensitivities: Sensitivity[];
     if (q.sensitivity) {
       if (q.sensitivity !== "normal" && !stepped) throw new DomainError("step_up_required", STEP_UP_MSG);
@@ -239,7 +242,8 @@ export function mountV1(app: Express, deps: V1Deps): void {
     const answer = z.object({ question_id: z.string(), text: z.string().max(2000, "답변은 2000자까지 쓸 수 있어요.") });
     const b = parse(z.union([z.object({ answers: z.array(answer).min(1).max(20) }), answer]), req.body);
     const list = "answers" in b ? b.answers : [b];
-    res.json(interviewOut(svc.submitAnswers(uid(req), String(req.params.id), list)));
+    const r = svc.submitAnswers(uid(req), String(req.params.id), list);
+    res.json({ ...interviewOut(r.interview), redacted_count: r.redacted_count });
   }));
 
   r.post("/interviews/:id/extract", wrap(async (req, res) => {
@@ -290,8 +294,9 @@ export function mountV1(app: Express, deps: V1Deps): void {
   r.patch("/connections/:id", wrap((req, res) => {
     const b = parse(ConnectionPatch, req.body);
     const c = svc.ownConnection(uid(req), String(req.params.id));
-    if (svc.isScopeWidening(c, b)) stepUp(req);
-    res.json(connectionOut(svc.updateConnection(uid(req), c.id, b, ifMatch(req)), personaNames(uid(req))));
+    // Widening is enforced inside updateConnection (H-1); we only tell it whether step-up was shown.
+    const stepUpVerified = svc.isScopeWidening(c, b) && hasStepUp(req);
+    res.json(connectionOut(svc.updateConnection(uid(req), c.id, b, ifMatch(req), { stepUpVerified }), personaNames(uid(req))));
   }));
 
   r.delete("/connections/:id", wrap((req, res) => {
@@ -313,11 +318,11 @@ export function mountV1(app: Express, deps: V1Deps): void {
       connection_id: req.query.connection_id, from: req.query.from, to: req.query.to,
     });
     const page = paginate(svc.listAccessLogs(uid(req), q), req.query);
-    res.json({ ...page, items: page.items.map(logOut) });
+    res.json({ ...page, items: page.items.map((l) => logOut(uid(req), l)) });
   }));
 
-  function logOut(l: AccessLog) {
-    const fact_ids = l.fact_ids.filter((id) => svc.factExists(id)); // deleted facts never surface again
+  function logOut(userId: string, l: AccessLog) {
+    const fact_ids = l.fact_ids.filter((id) => svc.ownFactExists(userId, id)); // deleted facts never surface again
     return {
       id: l.id, connection: { id: l.connection_id, client_name: l.client_name }, tool: l.tool,
       persona_ids: l.persona_ids, fact_count: l.fact_ids.length, fact_ids, created_at: l.created_at,
@@ -326,16 +331,16 @@ export function mountV1(app: Express, deps: V1Deps): void {
 
   // ---------- exports ----------
   r.post("/exports", wrap((req, res) => {
-    stepUp(req);
+    stepUp(req, true);
     const e = svc.createExport(uid(req));
-    res.status(201).location(`/v1/exports/${e.id}`).json({ id: e.id, status: e.status, created_at: e.created_at });
+    res.status(201).location(`/v1/exports/${e.id}`).json({ id: e.id, status: e.status, created_at: e.created_at, expires_at: e.expires_at });
   }));
 
   r.get("/exports/:id", wrap((req, res) => {
     const e = svc.ownExport(uid(req), String(req.params.id));
-    const dl = auth.signDownload(e.id, uid(req));
+    const dl = auth.signDownload(e.id, uid(req), req.sessionId!);
     res.json({
-      id: e.id, status: e.status, created_at: e.created_at,
+      id: e.id, status: e.status, created_at: e.created_at, expires_at: e.expires_at,
       download_url: `${config.baseUrl}/v1/exports/${e.id}/download?token=${dl.token}`, download_expires_at: dl.expires_at,
     });
   }));
@@ -343,10 +348,17 @@ export function mountV1(app: Express, deps: V1Deps): void {
   r.get("/exports/:id/download", wrap((req, res) => {
     const id = String(req.params.id);
     const owner = typeof req.query.token === "string" ? auth.verifyDownload(req.query.token, id) : null;
-    const e = owner ? svc.exportById(id) : undefined;
-    if (!e || e.user_id !== owner) throw new DomainError("not_found", "다운로드 링크가 만료됐어요. 다시 요청해 주세요.");
+    const expired = () => new DomainError("not_found", "다운로드 링크가 만료됐어요. 다시 요청해 주세요.");
+    if (!owner) throw expired();
+    let e;
+    try {
+      e = svc.ownExport(owner, id);
+    } catch {
+      throw expired();
+    }
     res.setHeader("Content-Disposition", `attachment; filename="persona-hub-export-${e.id}.json"`);
     res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Referrer-Policy", "no-referrer");
     res.json(e.data);
   }));
 

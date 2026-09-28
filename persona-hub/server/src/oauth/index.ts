@@ -6,19 +6,40 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import express, { type Express, type Request, type Response, type NextFunction } from "express";
 import type { AccessTokenInfo, ModuleDeps, OAuthModule } from "../contracts.js";
 import { TEST_USER_ID, newId } from "../core/index.js";
+import { DEFAULT_KNOWN_CLIENTS } from "../config.js";
 
 const ACCESS_TTL = 3600;
 const REFRESH_TTL = 30 * 24 * 3600;
 const CODE_TTL = 600;
 const SESSION_TTL = 3600;
-const SESSION_COOKIE = "ph_sid";
+/** M-1 limits */
+const REGISTER_WINDOW_S = 3600;
+const MAX_CLIENTS = 10_000;
+const UNUSED_CLIENT_TTL_S = 24 * 3600;
+const TOKEN_PER_MINUTE = 60;
+const LOGIN_FREE_FAILURES = 5;
+const LOGIN_BASE_LOCK_S = 30;
+const LOGIN_MAX_LOCK_S = 3600;
+
+/** Brand names that only allowlisted clients may use without a warning (C-1). */
+const BRANDS = ["claude", "anthropic", "chatgpt", "openai", "gpt", "gemini", "google", "copilot", "microsoft", "perplexity"];
+
+export function brandIn(name: string): string | null {
+  const n = name.normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
+  return BRANDS.find((b) => n.includes(b)) ?? null;
+}
 
 interface Client {
   client_id: string;
-  client_secret?: string;
+  /** L-6: SHA-256 of the DCR client secret; the plaintext is only returned once at registration. */
+  client_secret_hash?: string;
   client_name: string;
   redirect_uris: string[];
   created_at: number;
+  /** C-1: client_name uses a known brand but the redirect origins are not allowlisted. */
+  brand_warning: boolean;
+  /** Set on first user approval; unused clients are dropped after 24h (M-1). */
+  consented: boolean;
 }
 interface AuthRequest {
   client_id: string;
@@ -73,8 +94,6 @@ function isAllowedRedirect(uri: string): boolean {
   }
 }
 
-const KNOWN_CLIENTS = /(claude|chatgpt|openai|gemini|copilot|perplexity)/i;
-
 function cors(req: Request, res: Response, next: NextFunction) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -92,13 +111,40 @@ function oauthError(res: Response, status: number, error: string, description?: 
   res.json(description ? { error, error_description: description } : { error });
 }
 
+class BadRequest extends Error {}
+
+/** L-1: an undecodable cookie is a client error (400), never an uncaught URIError (500 + stack). */
 function parseCookies(req: Request): Record<string, string> {
   const out: Record<string, string> = {};
   for (const part of (req.headers.cookie ?? "").split(";")) {
     const i = part.indexOf("=");
-    if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+    if (i <= 0) continue;
+    try {
+      out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+    } catch {
+      throw new BadRequest("malformed cookie");
+    }
   }
   return out;
+}
+
+/** Fixed-window counter with self-cleanup. */
+class Window {
+  private readonly m = new Map<string, { start: number; count: number }>();
+  constructor(private readonly limit: number, private readonly windowS: number) {}
+  hit(key: string): boolean {
+    const t = now();
+    let w = this.m.get(key);
+    if (!w || t - w.start >= this.windowS) {
+      w = { start: t, count: 0 };
+      this.m.set(key, w);
+      if (this.m.size > 10_000) this.sweep(t);
+    }
+    return ++w.count <= this.limit;
+  }
+  sweep(t = now()) {
+    for (const [k, v] of this.m) if (t - v.start >= this.windowS) this.m.delete(k);
+  }
 }
 
 function str(v: unknown): string | undefined {
@@ -114,7 +160,16 @@ function redirectWith(uri: string, params: Record<string, string | undefined>): 
 export function createOAuth(deps: ModuleDeps): OAuthModule {
   const { core, config } = deps;
   const issuer = config.baseUrl.replace(/\/+$/, "");
+  const mcpResource = `${issuer}/mcp`;
   const secureCookie = issuer.startsWith("https://");
+  // M-2: __Host- prefix pins the cookie to this host (requires Secure, so only over https).
+  const SESSION_COOKIE = secureCookie ? "__Host-ph_sid" : "ph_sid";
+  const knownClients = config.knownClients ?? DEFAULT_KNOWN_CLIENTS;
+  const registerLimit = new Window(config.registerPerHour ?? 10, REGISTER_WINDOW_S);
+  const tokenLimit = new Window(TOKEN_PER_MINUTE, 60);
+  const loginFailures = new Map<string, { fails: number; lockedUntil: number; last: number }>();
+  /** H-3: (client_id, redirect_uri) pairs the user has approved at least once. */
+  const consentedRedirects = new Set<string>();
 
   const clients = new Map<string, Client>();
   const sessions = new Map<string, Session>();
@@ -122,19 +177,83 @@ export function createOAuth(deps: ModuleDeps): OAuthModule {
   const tokens = new Map<string, StoredToken>(); // key: sha256(token)
 
   // ---- helpers ----
-  function getSession(req: Request, res: Response): Session {
+  function setSessionCookie(res: Response, sid: string) {
+    res.setHeader(
+      "Set-Cookie",
+      `${SESSION_COOKIE}=${sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_TTL}${secureCookie ? "; Secure" : ""}`,
+    );
+  }
+
+  function getSession(req: Request, res: Response): Session & { sid: string } {
     const sid = parseCookies(req)[SESSION_COOKIE];
     const s = sid ? sessions.get(sid) : undefined;
-    if (s && s.expiresAt > now()) return s;
+    if (sid && s && s.expiresAt > now()) return Object.assign(s, { sid });
     if (sid) sessions.delete(sid);
+    if (sessions.size > 50_000) for (const [k, v] of sessions) if (v.expiresAt <= now()) sessions.delete(k);
     const newSid = rand();
     const fresh: Session = { userId: null, csrf: rand(24), expiresAt: now() + SESSION_TTL };
     sessions.set(newSid, fresh);
-    res.setHeader(
-      "Set-Cookie",
-      `${SESSION_COOKIE}=${newSid}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_TTL}${secureCookie ? "; Secure" : ""}`,
-    );
-    return fresh;
+    setSessionCookie(res, newSid);
+    return Object.assign(fresh, { sid: newSid });
+  }
+
+  /** M-2: new session id on privilege change (login); the old id is dead. */
+  function rotateSession(res: Response, old: string, userId: string): Session {
+    sessions.delete(old);
+    const sid = rand();
+    const s: Session = { userId, csrf: rand(24), expiresAt: now() + SESSION_TTL };
+    sessions.set(sid, s);
+    setSessionCookie(res, sid);
+    return s;
+  }
+
+  /** C-1: display name when EVERY registered redirect origin is allowlisted under the same name. */
+  function verifiedName(client: Client): string | null {
+    let name: string | null = null;
+    for (const u of client.redirect_uris) {
+      let origin: string;
+      try {
+        origin = new URL(u).origin;
+      } catch {
+        return null;
+      }
+      const n = Object.hasOwn(knownClients, origin) ? knownClients[origin] : undefined;
+      if (!n || (name !== null && n !== name)) return null;
+      name = n;
+    }
+    return name;
+  }
+
+  /** H-3: may we send errors back to this redirect_uri without the user seeing our page first? */
+  function trustedRedirect(client: Client, redirectUri: string): boolean {
+    return verifiedName(client) !== null || consentedRedirects.has(`${client.client_id}\n${redirectUri}`);
+  }
+
+  function sweepClients() {
+    const t = now();
+    for (const [id, c] of clients) if (!c.consented && t - c.created_at > UNUSED_CLIENT_TTL_S) clients.delete(id);
+  }
+
+  // ---- login throttling (M-1): per session and per IP, exponential lock after 5 failures ----
+  function loginKeys(req: Request, sid: string) {
+    return [`sid:${sid}`, `ip:${req.ip ?? "unknown"}`];
+  }
+  function loginLockedFor(keys: string[]): number {
+    const t = now();
+    return Math.max(0, ...keys.map((k) => (loginFailures.get(k)?.lockedUntil ?? 0) - t));
+  }
+  function recordLoginFailure(keys: string[]) {
+    const t = now();
+    if (loginFailures.size > 50_000) for (const [k, v] of loginFailures) if (t - v.last > LOGIN_MAX_LOCK_S) loginFailures.delete(k);
+    for (const k of keys) {
+      const f = loginFailures.get(k) ?? { fails: 0, lockedUntil: 0, last: t };
+      f.fails++;
+      f.last = t;
+      if (f.fails >= LOGIN_FREE_FAILURES) {
+        f.lockedUntil = t + Math.min(LOGIN_MAX_LOCK_S, LOGIN_BASE_LOCK_S * 2 ** (f.fails - LOGIN_FREE_FAILURES));
+      }
+      loginFailures.set(k, f);
+    }
   }
 
   function dropConnectionTokens(connectionId: string) {
@@ -176,15 +295,19 @@ export function createOAuth(deps: ModuleDeps): OAuthModule {
     if (!redirectUri || !client.redirect_uris.includes(redirectUri))
       return { ok: false, fatal: "등록되지 않은 redirect_uri예요." };
     const state = str(q.state);
-    const fail = (error: string, d: string) => ({
-      ok: false as const,
-      redirect: redirectWith(redirectUri, { error, error_description: d, state, iss: issuer }),
-    });
+    const trusted = trustedRedirect(client, redirectUri);
+    // H-3: only trusted (allowlisted or previously approved) redirects get OAuth error redirects;
+    // everyone else sees our error page so /authorize can't be used as an open redirect.
+    const fail = (error: string, d: string) =>
+      trusted
+        ? { ok: false as const, redirect: redirectWith(redirectUri, { error, error_description: d, state, iss: issuer }) }
+        : { ok: false as const, fatal: `잘못된 연결 요청이에요 (${error}: ${d}).` };
     if (q.response_type !== "code") return fail("unsupported_response_type", "response_type must be code");
     const challenge = str(q.code_challenge);
     if (!challenge || !/^[A-Za-z0-9_-]{43,128}$/.test(challenge)) return fail("invalid_request", "code_challenge required");
     if (q.code_challenge_method !== "S256") return fail("invalid_request", "code_challenge_method must be S256");
-    const resource = str(q.resource);
+    // M-3: the resource (audience) is bound to the code; default is our MCP endpoint.
+    const resource = str(q.resource) ?? mcpResource;
     if (resource) {
       try {
         const r = new URL(resource);
@@ -238,6 +361,12 @@ export function createOAuth(deps: ModuleDeps): OAuthModule {
     });
 
     app.post("/register", cors, json, form, (req, res) => {
+      if (!registerLimit.hit(`ip:${req.ip ?? "unknown"}`)) {
+        res.setHeader("Retry-After", String(REGISTER_WINDOW_S));
+        return oauthError(res, 429, "slow_down", "too many registrations from this address");
+      }
+      if (clients.size >= MAX_CLIENTS) sweepClients();
+      if (clients.size >= MAX_CLIENTS) return oauthError(res, 503, "temporarily_unavailable", "registration is full");
       const b = (req.body ?? {}) as Record<string, unknown>;
       const uris = b.redirect_uris;
       if (!Array.isArray(uris) || uris.length === 0 || !uris.every((u) => typeof u === "string"))
@@ -251,19 +380,23 @@ export function createOAuth(deps: ModuleDeps): OAuthModule {
       if (gt !== undefined && (!Array.isArray(gt) || gt.some((g) => g !== "authorization_code" && g !== "refresh_token")))
         return oauthError(res, 400, "invalid_client_metadata", "unsupported grant_types");
       const rawName = str(b.client_name) ?? "이름 없는 앱";
+      const secret = authMethod === "client_secret_post" ? rand() : undefined;
       const client: Client = {
         client_id: newId("cli"),
         client_name: rawName.slice(0, 100),
         redirect_uris: uris as string[],
         created_at: now(),
-        client_secret: authMethod === "client_secret_post" ? rand() : undefined,
+        client_secret_hash: secret ? sha256(secret) : undefined,
+        brand_warning: false,
+        consented: false,
       };
+      client.brand_warning = brandIn(client.client_name) !== null && verifiedName(client) === null;
       clients.set(client.client_id, client);
       res.status(201).setHeader("Cache-Control", "no-store");
       res.json({
         client_id: client.client_id,
         client_id_issued_at: client.created_at,
-        ...(client.client_secret ? { client_secret: client.client_secret, client_secret_expires_at: 0 } : {}),
+        ...(secret ? { client_secret: secret, client_secret_expires_at: 0 } : {}),
         client_name: client.client_name,
         redirect_uris: client.redirect_uris,
         grant_types: ["authorization_code", "refresh_token"],
@@ -279,8 +412,8 @@ export function createOAuth(deps: ModuleDeps): OAuthModule {
         return sendHtml(res, 400, errorPage(v.fatal));
       }
       const s = getSession(req, res);
-      if (!s.userId) return sendHtml(res, 200, loginPage(v.req, s.csrf));
-      return sendHtml(res, 200, consentPage(v.client, v.req, s.csrf));
+      if (!s.userId) return sendHtml(res, 200, loginPage(v.req, s.csrf), v.req.redirect_uri);
+      return sendHtml(res, 200, consentPage(v.client, v.req, s.csrf, s.userId), v.req.redirect_uri);
     });
 
     app.post("/authorize/login", form, (req, res) => {
@@ -292,11 +425,21 @@ export function createOAuth(deps: ModuleDeps): OAuthModule {
       }
       const s = getSession(req, res);
       if (!str(b.csrf) || !safeEq(String(b.csrf), s.csrf)) return sendHtml(res, 403, errorPage("요청이 만료됐어요. 다시 시도해 주세요."));
-      if (!str(b.password) || !safeEq(sha256(String(b.password)), sha256(config.testUserPassword)))
-        return sendHtml(res, 401, loginPage(v.req, s.csrf, "비밀번호가 맞지 않아요."));
-      s.userId = TEST_USER_ID;
-      s.csrf = rand(24); // rotate on privilege change
-      return sendHtml(res, 200, consentPage(v.client, v.req, s.csrf));
+      const keys = loginKeys(req, s.sid);
+      const locked = loginLockedFor(keys);
+      if (locked > 0) {
+        s.csrf = rand(24);
+        res.setHeader("Retry-After", String(locked));
+        return sendHtml(res, 429, loginPage(v.req, s.csrf, `로그인 시도가 너무 많아요. ${locked}초 후에 다시 시도해 주세요.`), v.req.redirect_uri);
+      }
+      if (!str(b.password) || !safeEq(sha256(String(b.password)), sha256(config.testUserPassword))) {
+        recordLoginFailure(keys);
+        s.csrf = rand(24); // M-1: a failed attempt spends the csrf token
+        return sendHtml(res, 401, loginPage(v.req, s.csrf, "비밀번호가 맞지 않아요."), v.req.redirect_uri);
+      }
+      for (const k of keys) loginFailures.delete(k);
+      const fresh = rotateSession(res, s.sid, TEST_USER_ID); // M-2: new session id + csrf on login
+      return sendHtml(res, 200, consentPage(v.client, v.req, fresh.csrf, TEST_USER_ID), v.req.redirect_uri);
     });
 
     app.post("/authorize/consent", form, (req, res) => {
@@ -308,22 +451,28 @@ export function createOAuth(deps: ModuleDeps): OAuthModule {
       }
       const s = getSession(req, res);
       if (!str(b.csrf) || !safeEq(String(b.csrf), s.csrf)) return sendHtml(res, 403, errorPage("요청이 만료됐어요. 다시 시도해 주세요."));
-      if (!s.userId) return sendHtml(res, 200, loginPage(v.req, s.csrf));
+      if (!s.userId) return sendHtml(res, 200, loginPage(v.req, s.csrf), v.req.redirect_uri);
       const r = v.req;
+      const userId = s.userId;
       if (b.decision !== "approve")
         return res.redirect(303, redirectWith(r.redirect_uri, { error: "access_denied", state: r.state, iss: issuer }));
 
       const raw = b.persona_ids;
       const requested = (Array.isArray(raw) ? raw : raw === undefined ? [] : [raw]).filter((x): x is string => typeof x === "string");
-      const owned = new Set(core.listUserPersonas(s.userId).map((p) => p.id));
+      const owned = new Set(core.listUserPersonas(userId).map((p) => p.id));
       const personaIds = [...new Set(requested)].filter((id) => owned.has(id));
-      if (personaIds.length === 0) return sendHtml(res, 400, consentPage(v.client, r, s.csrf, "페르소나를 하나 이상 선택해 주세요."));
+      if (personaIds.length === 0) return sendHtml(res, 400, consentPage(v.client, r, s.csrf, userId, "페르소나를 하나 이상 선택해 주세요."), r.redirect_uri);
       const maxSensitivity = b.max_sensitivity === "sensitive" ? "sensitive" : "normal";
+      // M-4: sensitive scope only with the user's separate 민감정보 consent.
+      if (maxSensitivity === "sensitive" && !hasSensitiveConsent(userId))
+        return sendHtml(res, 400, consentPage(v.client, r, s.csrf, userId, "민감정보 공유에 동의하지 않아서 민감 정보는 공유할 수 없어요."), r.redirect_uri);
 
+      v.client.consented = true;
+      consentedRedirects.add(`${v.client.client_id}\n${r.redirect_uri}`);
       const conn = core.createConnection({
-        user_id: s.userId,
+        user_id: userId,
         client_id: v.client.client_id,
-        client_name: v.client.client_name,
+        client_name: verifiedName(v.client) ?? v.client.client_name,
         persona_ids: personaIds,
         max_sensitivity: maxSensitivity,
       });
@@ -335,8 +484,17 @@ export function createOAuth(deps: ModuleDeps): OAuthModule {
 
     app.post("/token", cors, json, form, (req, res) => {
       const b = (req.body ?? {}) as Record<string, unknown>;
-      const client = authenticateClient(req, b);
+      let client: Client | null;
+      try {
+        client = authenticateClient(req, b);
+      } catch {
+        return oauthError(res, 400, "invalid_request", "malformed Authorization header");
+      }
       if (!client) return oauthError(res, 401, "invalid_client", "client authentication failed");
+      if (!tokenLimit.hit(`${client.client_id}|${req.ip ?? "unknown"}`)) {
+        res.setHeader("Retry-After", "60");
+        return oauthError(res, 429, "slow_down", "too many token requests");
+      }
       const gt = b.grant_type;
 
       if (gt === "authorization_code") {
@@ -360,10 +518,12 @@ export function createOAuth(deps: ModuleDeps): OAuthModule {
         if (!/^[A-Za-z0-9._~-]{43,128}$/.test(verifier)) return oauthError(res, 400, "invalid_grant", "malformed code_verifier");
         const computed = createHash("sha256").update(verifier).digest("base64url");
         if (!safeEq(computed, c.code_challenge)) return oauthError(res, 400, "invalid_grant", "PKCE verification failed");
-        const resource = str(b.resource) ?? c.resource;
+        // M-3: the resource was bound at /authorize; /token may repeat it but never change it.
+        const asked = str(b.resource);
+        if (asked !== undefined && asked !== c.resource) return oauthError(res, 400, "invalid_target", "resource does not match the authorization");
         if (!core.activeConnection(c.connectionId)) return oauthError(res, 400, "invalid_grant", "connection revoked");
         res.setHeader("Cache-Control", "no-store");
-        return res.json(issueTokens(c.connectionId, client.client_id, resource));
+        return res.json(issueTokens(c.connectionId, client.client_id, c.resource));
       }
 
       if (gt === "refresh_token") {
@@ -385,6 +545,8 @@ export function createOAuth(deps: ModuleDeps): OAuthModule {
           dropConnectionTokens(t.connectionId);
           return oauthError(res, 400, "invalid_grant", "connection revoked");
         }
+        const asked = str(b.resource);
+        if (asked !== undefined && asked !== t.resource) return oauthError(res, 400, "invalid_target", "resource does not match the grant");
         t.rotated = true; // keep tombstone to detect reuse
         res.setHeader("Cache-Control", "no-store");
         return res.json(issueTokens(t.connectionId, client.client_id, t.resource));
@@ -395,7 +557,12 @@ export function createOAuth(deps: ModuleDeps): OAuthModule {
 
     app.post("/revoke", cors, json, form, (req, res) => {
       const b = (req.body ?? {}) as Record<string, unknown>;
-      const client = authenticateClient(req, b);
+      let client: Client | null;
+      try {
+        client = authenticateClient(req, b);
+      } catch {
+        return oauthError(res, 400, "invalid_request", "malformed Authorization header");
+      }
       if (!client) return oauthError(res, 401, "invalid_client");
       const tok = str(b.token);
       if (!tok) return oauthError(res, 400, "invalid_request", "token required");
@@ -412,6 +579,27 @@ export function createOAuth(deps: ModuleDeps): OAuthModule {
       res.setHeader("Cache-Control", "no-store");
       return res.status(200).end();
     });
+
+    // L-1: malformed cookies etc. → 400 page, never a stack trace.
+    app.use(["/authorize", "/authorize/login", "/authorize/consent"], (err: unknown, _req: Request, res: Response, next: NextFunction) => {
+      if (err instanceof BadRequest || (err as { status?: number })?.status === 400) return sendHtml(res, 400, errorPage("요청 형식이 올바르지 않아요."));
+      next(err);
+    });
+
+    const sweep = setInterval(() => {
+      sweepClients();
+      registerLimit.sweep();
+      tokenLimit.sweep();
+      const t = now();
+      for (const [k, v] of sessions) if (v.expiresAt <= t) sessions.delete(k);
+      for (const [k, c] of codes) if (c.expiresAt <= t - CODE_TTL) codes.delete(k);
+      for (const [k, v] of loginFailures) if (t - v.last > LOGIN_MAX_LOCK_S && v.lockedUntil <= t) loginFailures.delete(k);
+    }, 10 * 60_000);
+    sweep.unref();
+  }
+
+  function hasSensitiveConsent(userId: string): boolean {
+    return core.userConsents(userId)?.sensitive_data === true;
   }
 
   function authenticateClient(req: Request, b: Record<string, unknown>): Client | null {
@@ -419,15 +607,20 @@ export function createOAuth(deps: ModuleDeps): OAuthModule {
     let secret = str(b.client_secret);
     const auth = req.headers.authorization;
     if (!clientId && auth?.startsWith("Basic ")) {
-      // tolerated for interop even though not advertised
-      const [id, sec] = Buffer.from(auth.slice(6), "base64").toString().split(":");
-      clientId = decodeURIComponent(id ?? "");
-      secret = sec !== undefined ? decodeURIComponent(sec) : undefined;
+      // tolerated for interop even though not advertised. Throws BadRequest on malformed input (L-1).
+      const raw = Buffer.from(auth.slice(6), "base64").toString();
+      const i = raw.indexOf(":");
+      try {
+        clientId = decodeURIComponent(i >= 0 ? raw.slice(0, i) : raw);
+        secret = i >= 0 ? decodeURIComponent(raw.slice(i + 1)) : undefined;
+      } catch {
+        throw new BadRequest("malformed basic auth");
+      }
     }
     const client = clientId ? clients.get(clientId) : undefined;
     if (!client) return null;
-    if (client.client_secret) {
-      if (!secret || !safeEq(secret, client.client_secret)) return null;
+    if (client.client_secret_hash) {
+      if (!secret || !safeEq(sha256(secret), client.client_secret_hash)) return null;
     }
     return client;
   }
@@ -445,21 +638,36 @@ export function createOAuth(deps: ModuleDeps): OAuthModule {
       dropConnectionTokens(t.connectionId);
       return null;
     }
-    return { token, connectionId: t.connectionId, clientId: t.clientId, expiresAt: t.expiresAt };
+    return { token, connectionId: t.connectionId, clientId: t.clientId, expiresAt: t.expiresAt, resource: t.resource };
   }
 
   // ---- HTML ----
-  function sendHtml(res: Response, status: number, html: string) {
+  /**
+   * L-2: script-src only via a per-response nonce; form-action is 'self' plus the origin of the
+   * already-validated redirect_uri (Chrome checks the 303 target against form-action).
+   */
+  function sendHtml(res: Response, status: number, html: string, redirectUri?: string) {
+    const nonce = randomBytes(16).toString("base64");
+    let redirectOrigin = "";
+    if (redirectUri) {
+      try {
+        redirectOrigin = ` ${new URL(redirectUri).origin}`;
+      } catch {
+        redirectOrigin = "";
+      }
+    }
     res.status(status);
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("X-Frame-Options", "DENY");
+    res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("Referrer-Policy", "no-referrer");
+    if (secureCookie) res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
     res.setHeader(
       "Content-Security-Policy",
-      "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self' https: http://localhost:* http://127.0.0.1:*; frame-ancestors 'none'",
+      `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; form-action 'self'${redirectOrigin}; frame-ancestors 'none'; base-uri 'none'`,
     );
-    res.send(html);
+    res.send(html.replaceAll("__CSP_NONCE__", nonce));
   }
 
   function layout(title: string, body: string): string {
@@ -488,22 +696,35 @@ ${error ? `<p class="error" role="alert">${esc(error)}</p>` : ""}
     );
   }
 
-  function consentPage(client: Client, r: AuthRequest, csrf: string, error?: string): string {
-    const personas = core.listUserPersonas(TEST_USER_ID);
-    const verified = KNOWN_CLIENTS.test(client.client_name);
+  function consentPage(client: Client, r: AuthRequest, csrf: string, userId: string, error?: string): string {
+    const personas = core.listUserPersonas(userId);
+    const verified = verifiedName(client);
+    const displayName = verified ?? client.client_name;
+    let host = r.redirect_uri;
+    try {
+      host = new URL(r.redirect_uri).host;
+    } catch {
+      /* validated earlier */
+    }
+    const sensitiveOk = hasSensitiveConsent(userId);
     const cards = personas
       .map(
         (p) => `<label class="persona card"><input type="checkbox" name="persona_ids" value="${esc(p.id)}">
 <span class="pbody"><strong>${esc(p.name)}</strong><span class="muted">${esc(p.summary)}</span></span></label>`,
       )
       .join("");
+    // C-1: the redirect host is ALWAYS shown; the badge comes only from the server allowlist.
+    const dest = `<p class="muted dest">정보를 받는 주소: <code>${esc(host)}</code></p>`;
+    const brandWarn = client.brand_warning
+      ? `<div class="warn" role="alert"><strong>주의: 공식 앱이 아닐 수 있어요</strong><br>이름에 잘 알려진 서비스 이름이 들어 있지만, 등록된 주소가 해당 서비스의 공식 주소가 아니에요.</div>`
+      : "";
     const badge = verified
-      ? `<span class="badge ok">✓ 확인된 앱</span>`
-      : `<div class="warn" role="note"><strong>확인되지 않은 앱이에요</strong><br>아래 주소로 정보가 전달돼요. 아는 앱인지 확인해 주세요.<br><code>${esc(r.redirect_uri)}</code></div>`;
+      ? `<span class="badge ok">✓ 확인된 앱</span>${dest}`
+      : `<div class="warn" role="note"><strong>확인되지 않은 앱이에요</strong><br>아래 주소로 정보가 전달돼요. 아는 앱인지 확인해 주세요.<br><code>${esc(r.redirect_uri)}</code></div>${brandWarn}${dest}`;
     return layout(
       "연결 요청",
       `<div class="brand">페르소나 허브</div>
-<h1>${esc(client.client_name)}가 페르소나 허브 연결을 요청해요</h1>
+<h1>${verified ? "" : "확인되지 않은 앱 "}${esc(displayName)}가 페르소나 허브 연결을 요청해요</h1>
 ${badge}
 <form method="post" action="/authorize/consent" id="consent">
 ${hiddenFields(r, csrf)}
@@ -512,12 +733,14 @@ ${cards || `<p class="muted">공유할 페르소나가 없어요.</p>`}
 <h2>공유할 정보 범위</h2>
 <div class="card radios">
 <label><input type="radio" name="max_sensitivity" value="normal" checked> 일반만</label>
-<label><input type="radio" name="max_sensitivity" value="sensitive"> 민감 포함</label>
+${sensitiveOk
+  ? `<label><input type="radio" name="max_sensitivity" value="sensitive"> 민감 포함</label>`
+  : `<label class="muted"><input type="radio" name="max_sensitivity" value="sensitive" disabled> 민감 포함</label><p class="hint">민감정보 공유에 동의하지 않았어요. 앱의 설정에서 동의하면 선택할 수 있어요.</p>`}
 <p class="hint" id="sens-warn" hidden>건강·재무 같은 민감 정보도 이 앱에 전달돼요.</p>
 </div>
 <ul class="notes"><li>비공개 정보는 절대 전달되지 않아요</li><li>언제든 앱에서 연결을 끊을 수 있어요</li></ul>
 <details class="card"><summary>국외 이전 고지</summary>
-<dl><dt>이전받는 자</dt><dd>${esc(client.client_name)} 운영사</dd>
+<dl><dt>이전받는 자</dt><dd>${esc(displayName)} 운영사</dd>
 <dt>이전 국가</dt><dd>미국 등 해당 서비스 운영 국가</dd>
 <dt>이전 항목</dt><dd>선택한 페르소나의 요약·지침 및 허용 범위 내 사실 정보</dd>
 <dt>이전 목적</dt><dd>AI 대화 개인화</dd>
@@ -528,8 +751,8 @@ ${error ? `<p class="error" role="alert">${esc(error)}</p>` : ""}
 <button class="secondary" type="submit" name="decision" value="deny" formnovalidate>거절</button>
 </div>
 </form>
-<script>(function(){var f=document.getElementById('consent'),a=document.getElementById('approve'),w=document.getElementById('sens-warn');
-function u(){a.disabled=f.querySelectorAll('input[name=persona_ids]:checked').length===0;w.hidden=!f.querySelector('input[name=max_sensitivity][value=sensitive]').checked;}
+<script nonce="__CSP_NONCE__">(function(){var f=document.getElementById('consent'),a=document.getElementById('approve'),w=document.getElementById('sens-warn');
+function u(){a.disabled=f.querySelectorAll('input[name=persona_ids]:checked').length===0;w.hidden=!f.querySelector('input[name=max_sensitivity][value=sensitive]:checked');}
 f.addEventListener('change',u);u();})();</script>`,
     );
   }

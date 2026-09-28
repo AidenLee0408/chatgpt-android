@@ -85,7 +85,8 @@ interface CachedResponse {
  * Idempotency-Key replay for POST/PATCH/DELETE (24h, per user + key). The first
  * completed response (except 401/429/5xx, which are safe to retry) is stored and
  * replayed verbatim with `Idempotent-Replayed: true`. Reusing a key for a different
- * method/path/body is a validation error.
+ * method/path/body is a validation error. Requests without an authenticated user
+ * pass through uncached (M-9).
  */
 export function idempotency(ttlMs = 24 * 3600_000): RequestHandler {
   const cache = new Map<string, CachedResponse>();
@@ -94,8 +95,11 @@ export function idempotency(ttlMs = 24 * 3600_000): RequestHandler {
     const key = req.header("idempotency-key");
     if (!key || !["POST", "PATCH", "DELETE"].includes(req.method)) return next();
     if (key.length > 200) return sendError(res, req, "validation_failed", "Idempotency-Key가 너무 길어요.", "Idempotency-Key");
+    // M-9: never key by IP — an unauthenticated request is simply not cached/replayed.
+    // Must be mounted after authentication so req.userId is set.
+    if (!req.userId) return next();
     const now = Date.now();
-    const ck = `${req.userId ?? `ip:${req.ip}`}:${key}`;
+    const ck = `${req.userId}:${key}`;
     const fingerprint = `${req.method} ${req.originalUrl} ${JSON.stringify(req.body ?? null)}`;
     const hit = cache.get(ck);
     if (hit && hit.expires > now) {
@@ -181,6 +185,7 @@ export const errorHandler: ErrorRequestHandler = (err, req, res, _next) => {
   if (err instanceof DomainError) return sendError(res, req, err.code, err.message, err.field);
   if (err?.type === "entity.parse.failed") return sendError(res, req, "validation_failed", "JSON 형식이 올바르지 않아요.");
   if (err?.type === "entity.too.large") return sendError(res, req, "validation_failed", "요청 본문이 너무 커요.");
-  console.error(`[${req.requestId}]`, err);
+  // L-8: never log the raw error (messages can carry request bodies / facts).
+  console.error(JSON.stringify({ request_id: req.requestId, error: err?.name ?? "Error", code: err?.code, stack: err?.stack?.split("\n").slice(1, 6).join(" | ") }));
   sendError(res, req, "internal", "일시적인 문제가 생겼어요. 잠시 후 다시 시도해 주세요.");
 };

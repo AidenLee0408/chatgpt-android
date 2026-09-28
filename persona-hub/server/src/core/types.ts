@@ -100,6 +100,8 @@ export interface InterviewAnswer {
   question_id: string;
   text: string;
   answered_at: string;
+  /** M-8: part of the raw answer matched a private pattern and was replaced by REDACTION_MARKER. */
+  redacted?: boolean;
 }
 
 export interface FactCandidate {
@@ -126,9 +128,11 @@ export interface ExportJob {
   id: string;
   user_id: string;
   status: "ready";
-  /** Snapshot taken at creation. */
+  /** Snapshot taken at creation. Dropped when the export expires (M-6). */
   data: unknown;
   created_at: string;
+  /** ISO time after which the export is gone (24h). */
+  expires_at: string;
 }
 
 /** Rotating refresh token (stored hashed). One family per login/device. */

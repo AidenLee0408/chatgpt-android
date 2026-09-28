@@ -48,8 +48,11 @@ async function connect(personaIds: string[], maxSensitivity: "normal" | "sensiti
   const challenge = createHash("sha256").update(verifier).digest("base64url");
   const q = new URLSearchParams({ client_id, redirect_uri: REDIRECT, response_type: "code", code_challenge: challenge, code_challenge_method: "S256", state: "xyz" });
   const a = await fetch(`${base}/authorize?${q}`);
-  const cookie = a.headers.get("set-cookie")!.split(";")[0];
-  const login = await fetch(`${base}/authorize/login`, { method: "POST", headers: { cookie }, body: form({ ...hidden(await a.text()), password: PASSWORD }) });
+  const preCookie = a.headers.get("set-cookie")!.split(";")[0];
+  const login = await fetch(`${base}/authorize/login`, { method: "POST", headers: { cookie: preCookie }, body: form({ ...hidden(await a.text()), password: PASSWORD }) });
+  // M-2: login issues a new session id; the pre-login cookie is dead.
+  const cookie = login.headers.get("set-cookie")!.split(";")[0];
+  assert.notEqual(cookie, preCookie);
   const consentHtml = await login.text();
   assert.match(consentHtml, /Claude가 페르소나 허브 연결을 요청해요/);
   const approve = await fetch(`${base}/authorize/consent`, {
