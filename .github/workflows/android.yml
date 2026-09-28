@@ -3,8 +3,10 @@ name: Android CI
 on:
   push:
     branches: [ main ]
+    paths-ignore: [ 'persona-hub/**' ]
   pull_request:
     branches: [ main ]
+    paths-ignore: [ 'persona-hub/**' ]
 
 jobs:
   build:
