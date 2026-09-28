@@ -82,6 +82,7 @@ export class CoreService {
       created_at: new Date().toISOString(),
       revoked_at: null,
       last_accessed_at: null,
+      version: 1,
     };
     this.store.connections.set(conn.id, conn);
     return conn;
@@ -92,13 +93,17 @@ export class CoreService {
     if (!c || c.user_id !== userId || c.revoked_at) return null;
     c.persona_ids = this.ownedIds(userId, scope.persona_ids);
     c.max_sensitivity = clampSensitivity(scope.max_sensitivity);
+    c.version = (c.version ?? 1) + 1;
     return c;
   }
 
   revokeConnection(connectionId: string, userId: string): boolean {
     const c = this.store.connections.get(connectionId);
     if (!c || c.user_id !== userId) return false;
-    c.revoked_at ??= new Date().toISOString();
+    if (c.revoked_at === null) {
+      c.revoked_at = new Date().toISOString();
+      c.version = (c.version ?? 1) + 1;
+    }
     return true;
   }
 

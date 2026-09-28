@@ -10,7 +10,13 @@ export const PERSONA_HEALTH = "per_01J9HEALTH000000000000000";
 const UPDATED = "2026-10-05T02:11:09Z";
 
 export function seed(store: Store): void {
-  store.users.set(TEST_USER_ID, { id: TEST_USER_ID, display_name: "테스트 사용자" });
+  // Seeded user is on "pro" so the demo account can still create personas (it already has 3).
+  store.users.set(TEST_USER_ID, {
+    id: TEST_USER_ID, display_name: "테스트 사용자", plan: "pro", created_at: UPDATED, deleted_at: null,
+    consents: { terms: true, sensitive_data: true, marketing: false, updated_at: UPDATED },
+  });
+  // Dev login (ALLOW_DEV_LOGIN=1) with id_token "test-user" signs in as this seeded user.
+  store.identities.set("dev:test-user", { key: "dev:test-user", provider: "dev", subject: "test-user", user_id: TEST_USER_ID });
 
   const personas = [
     {
@@ -36,7 +42,7 @@ export function seed(store: Store): void {
     },
   ];
   for (const p of personas) {
-    store.personas.set(p.id, { ...p, user_id: TEST_USER_ID, archived: false, updated_at: UPDATED });
+    store.personas.set(p.id, { ...p, user_id: TEST_USER_ID, archived: false, updated_at: UPDATED, created_at: UPDATED, version: 1 });
   }
 
   const facts: Array<[string, string, Category, string, Sensitivity]> = [
@@ -56,7 +62,7 @@ export function seed(store: Store): void {
     ["fct_M03", PERSONA_HEALTH, "health", "허리 디스크 이력, 무리한 스쿼트 피함", "sensitive"],
   ];
   for (const [id, persona_id, category, body, sensitivity] of facts) {
-    const fact: Fact = { id, persona_id, category, body, sensitivity, source: "manual", updated_at: UPDATED };
+    const fact: Fact = { id, persona_id, category, body, sensitivity, source: "manual", updated_at: UPDATED, created_at: UPDATED, version: 1 };
     store.facts.set(id, fact);
   }
 }
