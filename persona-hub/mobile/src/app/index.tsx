@@ -1,6 +1,10 @@
 import { Redirect } from 'expo-router';
+import { useSession } from '../state/session';
 
-/** Entry: the auth gate in _layout decides; default to the personas tab. */
+/** Entry: route by session so a signed-out user never lands on a tab that 401s. */
 export default function Index() {
-  return <Redirect href="/personas" />;
+  const { status, onboardingPending } = useSession();
+  if (status === 'loading') return null;
+  if (status === 'signedOut') return <Redirect href="/login" />;
+  return <Redirect href={onboardingPending ? '/onboarding/intro' : '/personas'} />;
 }
