@@ -1,6 +1,6 @@
 import * as LocalAuthentication from 'expo-local-authentication';
 import { Platform } from 'react-native';
-import { API_URL } from './config';
+import { getApiUrl } from './config';
 import { randomId, tokenStore } from './tokenStore';
 import type { ApiErrorBody, ApiErrorCode, StepUpResponse, TokenPair } from './types';
 
@@ -73,7 +73,7 @@ function buildUrl(path: string, query?: RequestOptions['query']) {
         .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
         .join('&')
     : '';
-  return `${API_URL}${path}${qs ? `?${qs}` : ''}`;
+  return `${getApiUrl()}${path}${qs ? `?${qs}` : ''}`;
 }
 
 async function rawFetch(path: string, opts: RequestOptions, extra: Record<string, string>): Promise<Response> {

@@ -1,11 +1,12 @@
 import * as SecureStore from 'expo-secure-store';
 import { Platform } from 'react-native';
+import { setApiUrlInMemory } from './config';
 
 /**
  * Tokens live in expo-secure-store (Keychain / Keystore). On web (dev only)
  * secure-store is unavailable, so we fall back to in-memory + localStorage.
  */
-const KEYS = { access: 'ph.access_token', refresh: 'ph.refresh_token', device: 'ph.device_id', onboarding: 'ph.onboarding_pending' } as const;
+const KEYS = { access: 'ph.access_token', refresh: 'ph.refresh_token', device: 'ph.device_id', onboarding: 'ph.onboarding_pending', server: 'ph.server_url' } as const;
 
 const mem = new Map<string, string>();
 const webStorage: Storage | undefined =
@@ -65,6 +66,14 @@ export const tokenStore = {
   /** "1" while a new user hasn't finished S-02/S-03. Survives relaunch. */
   getOnboardingPending: async () => (await get(KEYS.onboarding)) === '1',
   setOnboardingPending: (v: boolean) => set(KEYS.onboarding, v ? '1' : null),
+  /** Restores a dev-set server URL into the API client. Call once at startup. */
+  async loadServerUrl() {
+    setApiUrlInMemory(await get(KEYS.server));
+  },
+  async setServerUrl(url: string | null) {
+    await set(KEYS.server, url);
+    setApiUrlInMemory(url);
+  },
   subscribe(l: Listener) {
     listeners.add(l);
     return () => void listeners.delete(l);

@@ -1,7 +1,7 @@
 /** S-01 스플래시·로그인 */
 import { View } from 'react-native';
-import { DEV_LOGIN, errorMessage, tokenStore, useLogin, type LoginProvider } from '../../api';
-import { Button, InlineBanner, Screen, useToast } from '../../components';
+import { DEV_LOGIN, errorMessage, getApiUrl, normalizeApiUrl, tokenStore, useLogin, type LoginProvider } from '../../api';
+import { Button, InlineBanner, Screen, TextField, useToast } from '../../components';
 import { Text, useTheme } from '../../theme';
 import { useState } from 'react';
 import { Feather } from '@expo/vector-icons';
@@ -17,6 +17,25 @@ export default function LoginScreen() {
   const toast = useToast();
   const login = useLogin();
   const [pending, setPending] = useState<string | null>(null);
+  const [server, setServer] = useState(getApiUrl());
+
+  /** Dev only: apply the typed server address before logging in. */
+  async function applyServer() {
+    if (normalizeApiUrl(server) !== getApiUrl()) await tokenStore.setServerUrl(server);
+  }
+
+  /** Dev only: the seeded account with 업무·취미·건강 personas. */
+  async function demoLogin() {
+    setPending('demo');
+    try {
+      await applyServer();
+      await login.mutateAsync({ provider: 'dev', id_token: 'test-user' });
+    } catch {
+      // error shown via login.error
+    } finally {
+      setPending(null);
+    }
+  }
 
   async function onPress(provider: (typeof PROVIDERS)[number]['id']) {
     if (!DEV_LOGIN) {
@@ -26,6 +45,7 @@ export default function LoginScreen() {
     }
     setPending(provider);
     try {
+      await applyServer();
       const id_token = await tokenStore.getDeviceId();
       await login.mutateAsync({ provider: 'dev', id_token });
       // AuthGate routes onward: new user → onboarding, returning user → tabs.
@@ -65,9 +85,27 @@ export default function LoginScreen() {
           />
         ))}
         {DEV_LOGIN ? (
-          <Text variant="caption" tone="secondary" style={{ textAlign: 'center' }}>
-            개발 모드: 이 기기 전용 테스트 계정으로 로그인해요.
-          </Text>
+          <>
+            <Button
+              label="체험 계정으로 둘러보기"
+              variant="ghost"
+              loading={pending === 'demo'}
+              disabled={pending !== null && pending !== 'demo'}
+              onPress={demoLogin}
+            />
+            <TextField
+              label="서버 주소 (개발 모드)"
+              value={server}
+              onChangeText={setServer}
+              autoCapitalize="none"
+              autoCorrect={false}
+              keyboardType="url"
+              placeholder="http://192.168.0.10:3000"
+            />
+            <Text variant="caption" tone="secondary" style={{ textAlign: 'center' }}>
+              개발 모드: 위 버튼은 이 기기 전용 테스트 계정으로 로그인해요.
+            </Text>
+          </>
         ) : null}
         <Text variant="caption" tone="secondary" style={{ textAlign: 'center' }}>
           시작하면 이용약관과 개인정보 처리방침을 확인하게 돼요.

@@ -19,7 +19,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   const [onboardingPending, setPending] = useState(false);
   useEffect(() => {
     let alive = true;
-    Promise.all([tokenStore.getAccess(), tokenStore.getOnboardingPending()]).then(([t, pending]) => {
+    tokenStore.loadServerUrl().then(() => Promise.all([tokenStore.getAccess(), tokenStore.getOnboardingPending()])).then(([t, pending]) => {
       if (!alive) return;
       setPending(pending);
       setStatus(t ? 'signedIn' : 'signedOut');

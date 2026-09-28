@@ -62,3 +62,29 @@ src/
 - **Errors**: every failure is an `ApiError {status, code, message, field}`; `errorMessage(e)` gives Korean copy. Server `message` is user-safe.
 - **Step-up** is automatic: a 401 `step_up_required` triggers biometric → `POST /auth/step-up` → retry with `X-Step-Up-Token` (cached 5 min). If the user cancels, the call rejects with code `step_up_cancelled`.
 - **Concurrency**: pass `version` on PATCH (→ `If-Match`); handle `version_conflict` by refetching.
+
+## 휴대폰에 설치해서 써 보기 (안드로이드 APK)
+
+EAS 클라우드 빌드로 설치 파일을 만듭니다. Android Studio는 필요 없습니다.
+
+1. https://expo.dev 에서 무료 계정을 만든 뒤, 이 폴더에서 로그인합니다.
+   ```bash
+   npx eas-cli@latest login
+   ```
+2. APK를 빌드합니다. 약 10~20분 걸리고, 처음에는 프로젝트 연결과 서명 키 생성을 물어보면 모두 Yes를 누르면 됩니다.
+   ```bash
+   npx eas-cli@latest build -p android --profile preview
+   ```
+3. 끝나면 나오는 링크나 QR 코드로 휴대폰에서 APK를 받아 설치합니다. "출처를 알 수 없는 앱" 설치를 허용해야 합니다.
+4. PC에서 서버를 켭니다. PC와 휴대폰은 같은 와이파이여야 합니다.
+   ```bash
+   cd ../server && npm install && ALLOW_DEV_LOGIN=1 npm start
+   ```
+5. 앱 로그인 화면의 **서버 주소**에 `http://<PC의 내부 IP>:3000`을 넣고 로그인합니다.
+   - **카카오로 시작하기**: 새 계정으로 온보딩부터 시작합니다.
+   - **체험 계정으로 둘러보기**: 업무·취미·건강 페르소나가 미리 있는 계정입니다.
+
+참고
+- `preview` 빌드는 개발용입니다. 개발 로그인이 켜져 있고, 로컬 서버를 위해 http 통신을 허용합니다. 운영 빌드에서는 둘 다 꺼야 합니다.
+- 서버는 메모리 저장소라 서버를 끄면 데이터가 초기화됩니다.
+- iPhone 설치에는 Apple Developer 계정(연 $99)이 필요합니다. 그 전에는 Expo Go로 써 보세요(위 "실행" 참고).
